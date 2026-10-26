@@ -1,0 +1,21 @@
+[Unit]
+Description=UGV ROS2 base nodes + V7RC bridge (in docker container ugv_rpi_ros_humble)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+# Keep retrying instead of giving up after a few quick failures
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# The container bind-mounts the desktop session's audio socket, which only exists after
+# user ws (uid 1000) logs in; wait up to 2 minutes for it before starting the container
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -e /run/user/1000/pulse/native ] && exit 0; sleep 2; done; exit 0'
+ExecStartPre=/usr/bin/docker start ugv_rpi_ros_humble
+ExecStart=/usr/bin/docker exec ugv_rpi_ros_humble bash /home/ws/ugv_ws/ugv_v7rc_start.sh
+ExecStop=/usr/bin/docker exec ugv_rpi_ros_humble pkill -f "lib/ugv_bringup/ugv_bringup|lib/ugv_bringup/ugv_driver|lib/v7rc_bridge/v7rc_bridge"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

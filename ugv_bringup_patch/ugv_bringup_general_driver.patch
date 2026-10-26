@@ -1,0 +1,102 @@
+diff --git a/src/ugv_main/ugv_bringup/ugv_bringup/ugv_bringup.py b/src/ugv_main/ugv_bringup/ugv_bringup/ugv_bringup.py
+index fc09523..d9da8db 100644
+--- a/src/ugv_main/ugv_bringup/ugv_bringup/ugv_bringup.py
++++ b/src/ugv_main/ugv_bringup/ugv_bringup/ugv_bringup.py
+@@ -11,6 +11,9 @@ from geometry_msgs.msg import Twist
+ from sensor_msgs.msg import Imu, MagneticField
+ import math
+ 
++# Floor calibration: odometry read 0.519 m for a measured 0.50 m run
++ODOM_SCALE = 0.50 / 0.519
++
+ # Helper class for reading lines from a serial port
+ class ReadLine:
+     def __init__(self, s):
+@@ -27,6 +30,8 @@ class ReadLine:
+         while True:
+             i = max(1, min(512, self.s.in_waiting))  # Read from serial buffer
+             data = self.s.read(i)
++            if not data:  # Serial timeout: give the executor a chance to run other timers
++                return b""
+             i = data.find(b"\n")
+             if i >= 0:
+                 r = self.buf + data[:i+1]
+@@ -51,13 +56,31 @@ class BaseController:
+         self.data_buffer = None  # Buffer for holding received data
+         # Base data structure to hold sensor values
+         self.base_data = {"T": 1001, "L": 0, "R": 0, "ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0, "mx": 0, "my": 0, "mz": 0, "odl": 0, "odr": 0, "v": 0}
+-    
++        # General Driver firmware (ugv_base_general) support:
++        # its T:1001 feedback has no raw IMU or odl/odr, so IMU is polled with {"T":126}
++        # and wheel speeds (m/s, measured by the encoders) are integrated into distance.
++        self.odl_m = 0.0
++        self.odr_m = 0.0
++        self.last_feedback_time = None
++        self.enable_feedback()
++
++    # The ESP32 forgets these settings when it loses power, so they are re-sent by a watchdog
++    def enable_feedback(self):
++        self.send_command({"T": 143, "cmd": 0})  # Turn off UART command echo
++        self.send_command({"T": 131, "cmd": 1})  # Enable continuous base feedback
++
++    def feedback_stalled(self, timeout=1.0):
++        return self.last_feedback_time is None or time.monotonic() - self.last_feedback_time > timeout
++
+     # Function to read and return feedback data from the serial input
+     def feedback_data(self):
+         try:
+             line = self.rl.readline().decode('utf-8')  # Read line from UART
++            if not line.strip():
++                self.base_data["T"] = None  # Nothing received; do not republish stale data
++                return self.base_data
+             self.data_buffer = json.loads(line)  # Parse JSON data
+-            self.base_data = self.data_buffer  # Store received data
++            self.convert_general_feedback(self.data_buffer)  # Store received data in ROS Driver format
+             return self.base_data  # Return base data
+         except json.JSONDecodeError as e:
+             self.logger.error(f"JSON decode error: {e} with line: {line}")  # Log error
+@@ -66,6 +89,30 @@ class BaseController:
+             self.logger.error(f"[base_ctrl.feedback_data] unexpected error: {e}")
+             self.rl.clear_buffer()
+ 
++    # Convert General Driver feedback into the ROS Driver units the publishers expect
++    def convert_general_feedback(self, data):
++        msg_type = data.get("T")
++        if msg_type == 1001:  # Base feedback: L/R wheel speed (m/s), v (V)
++            now = time.monotonic()
++            if self.last_feedback_time is not None:
++                dt = now - self.last_feedback_time
++                if 0 < dt < 0.5:  # Skip gaps so a stall does not create a jump
++                    self.odl_m += float(data["L"]) * dt * ODOM_SCALE
++                    self.odr_m += float(data["R"]) * dt * ODOM_SCALE
++            self.last_feedback_time = now
++            self.base_data.update(L=data["L"], R=data["R"],
++                                  odl=self.odl_m * 100, odr=self.odr_m * 100,  # cm
++                                  v=float(data["v"]) * 100)  # 0.01 V
++            self.send_command({"T": 126})  # Ask for the next IMU sample
++        elif msg_type == 1002:  # IMU reply: accel (mg), gyro (deg/s), mag (raw)
++            for k in ("ax", "ay", "az"):
++                self.base_data[k] = float(data[k]) * 8192 / 1000  # -> LSB at 8192/g
++            for k in ("gx", "gy", "gz"):
++                self.base_data[k] = float(data[k]) * 16.4  # -> LSB at 16.4/(deg/s)
++            for k in ("mx", "my", "mz"):
++                self.base_data[k] = float(data[k])
++        self.base_data["T"] = msg_type
++
+     # Receive and decode data from the serial connection
+     def on_data_received(self):
+         self.ser.reset_input_buffer()
+@@ -99,6 +146,13 @@ class ugv_bringup(Node):
+         self.base_controller = BaseController('/dev/ttyAMA0', 115200)
+         # Timer to periodically execute the feedback loop
+         self.feedback_timer = self.create_timer(0.001, self.feedback_loop)
++        # Re-enable feedback if the driver board was power-cycled
++        self.watchdog_timer = self.create_timer(1.0, self.feedback_watchdog)
++
++    def feedback_watchdog(self):
++        if self.base_controller.feedback_stalled():
++            self.get_logger().warn("No base feedback for 1 s, re-enabling feedback on the driver board")
++            self.base_controller.enable_feedback()
+ 
+     # Main loop for reading sensor feedback and publishing it to ROS topics
+     def feedback_loop(self):

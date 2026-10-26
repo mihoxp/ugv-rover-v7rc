@@ -1,0 +1,14 @@
+[Unit]
+Description=V7RC Bluetooth (BLE) relay to v7rc_bridge (UDP 6188)
+After=bluetooth.service ugv-v7rc.service
+Requires=bluetooth.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/ws/ugv_ws/v7rc_ble_relay.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
